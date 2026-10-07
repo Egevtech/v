@@ -182,17 +182,10 @@ fn (mut c Create) prompt(args []string) {
 			exit(3)
 		}
 	}
-	c.description = prompt_input('Input your project description: ', '')
-	default_version := '0.0.0'
-	c.version = prompt_input('Input your project version: (${default_version}) ', default_version)
-	if c.version == '' {
-		c.version = default_version
-	}
-	default_license := 'MIT'
-	c.license = prompt_input('Input your project license: (${default_license}) ', default_license)
-	if c.license == '' {
-		c.license = default_license
-	}
+
+	c.version = '0.1.0'
+	c.description = ''
+	c.license = 'MIT'
 }
 
 fn get_template(cmd Command) Template {
