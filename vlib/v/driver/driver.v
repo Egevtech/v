@@ -40,6 +40,9 @@ $if !skip_eval ? {
 
 $if !skip_arm64 ? {
 	import v.gen.arm64
+}
+
+$if !skip_ssa ? {
 	import v.ssa
 	import v.ssa.optimize
 }
@@ -2246,9 +2249,10 @@ fn input_is_v3_compiler_entry(input_file string) bool {
 // `-cross` C (the `vc/v.c` bootstrap snapshots) leaves it out: FastC's libtcc linking
 // and Mach-O signing are host specific, so such a snapshot would not compile and link
 // everywhere. The compiler that `make` and `makev.bat` build from the snapshot
-// rebuilds `cmd/v` natively, which keeps FastC again.
-fn v3_compiles_fastc_by_default(input_file string, output_cross_c bool) bool {
-	return !output_cross_c && input_is_cmd_v(input_file)
+// rebuilds `cmd/v` through C, which keeps FastC again. Direct ARM64 builds leave
+// it out because their linker does not link the libtcc runtime.
+fn v3_compiles_fastc_by_default(input_file string, output_cross_c bool, backend string) bool {
+	return !output_cross_c && backend != 'arm64' && input_is_cmd_v(input_file)
 }
 
 fn input_is_cmd_v(input_file string) bool {
@@ -3966,7 +3970,7 @@ fn v3_crun_build_identity(state &V3ModuleCacheState, prefs &pref.Preferences, us
 }
 
 fn cli_usage() string {
-	return 'usage: v3 [run|crun|test] <file.v|directory> [options]\n' + '  -o <output>                  output binary or C file\n' + '  -b <c|fastc|arm64|wasm|eval> backend\n' + '  -os <name> -arch <name>      target platform\n' + '  -cc <compiler>               C compiler executable\n' + '  -cflags <flags>              extra C compiler options\n' + '  -ldflags <flags>             extra options appended to the link command\n' + '  -thread-stack-size <bytes>   spawned-thread stack size\n' + '  -prod -c99 -shared -strict   C build modes\n' + '  -v                           verbose stage profiling\n' + '  -silent                      suppress benchmark output\n' + '  -showcc                      print C compiler commands\n' + '  -trace-calls                 trace function entries to stderr\n' + '  -trace-fns <patterns>        restrict tracing to functions or modules\n' + '  -race                        detect data races at runtime (ThreadSanitizer)\n' + '  -profile [file]              write V1-compatible function profile data\n' + '  -profile-fns <names>         profile only named functions and their callees\n' + '  -profile-no-inline           omit @[inline] functions from the profile\n' + '  -no-memory-limit             disable the 10176 MiB user-build memory safety limit\n' + '  -memory-limit <size>         set a custom user-build memory safety limit\n                               to specify unit append K|M|G (or k|m|g) (default: M)\n' + '  -d <name>                    compile-time define'
+	return 'usage: v3 [run|crun|test] <file.v|directory> [options]\n' + '  -o <output>                  output binary or C file\n' + '  -b <c|fastc|arm64|wasm|eval> backend\n' + '  -os <name> -arch <name>      target platform\n' + '  -cc <compiler>               C compiler executable\n' + '  -cflags <flags>              extra C compiler options\n' + '  -ldflags <flags>             extra options appended to the link command\n' + '  -thread-stack-size <bytes>   spawned-thread stack size\n' + '  -prod -c99 -shared -strict   C build modes\n' + '  -v                           verbose stage profiling\n' + '  -show-timings                compiler stage timings without verbose traces\n' + '  -silent                      suppress benchmark output\n' + '  -showcc                      print C compiler commands\n' + '  -trace-calls                 trace function entries to stderr\n' + '  -trace-fns <patterns>        restrict tracing to functions or modules\n' + '  -race                        detect data races at runtime (ThreadSanitizer)\n' + '  -profile [file]              write V1-compatible function profile data\n' + '  -profile-fns <names>         profile only named functions and their callees\n' + '  -profile-no-inline           omit @[inline] functions from the profile\n' + '  -no-memory-limit             disable the 10176 MiB user-build memory safety limit\n' + '  -memory-limit <size>         set a custom user-build memory safety limit\n                               to specify unit append K|M|G (or k|m|g) (default: M)\n' + '  -d <name>                    compile-time define'
 }
 
 fn shared_library_postfix(target_os string) string {
@@ -7025,6 +7029,7 @@ struct V3BundledTccProbeOptions {
 	host_target         pref.Target
 	target              pref.Target
 	bundled_tcc         string
+	host_rejects_tcc    bool // see pref.host_rejects_tcc_executables; only an explicit `-cc tcc` selects TCC
 }
 
 fn v3_should_probe_bundled_tcc(options V3BundledTccProbeOptions) bool {
@@ -7040,6 +7045,9 @@ fn v3_should_probe_bundled_tcc(options V3BundledTccProbeOptions) bool {
 			options.c_compiler
 		}
 		return os.real_path(compiler_path) == os.real_path(options.bundled_tcc)
+	}
+	if options.host_rejects_tcc {
+		return false
 	}
 	if options.is_shared && !options.is_liveshared && options.target.os == 'linux' {
 		return false
@@ -7188,6 +7196,7 @@ fn v3_select_c_compiler(vroot string, requested V3BundledTccProbeOptions) V3CCom
 	bundled_tcc_available := v3_bundled_tcc_available(options)
 	allow_system_tcc := options.backend == 'c' && !options.c_only && !options.is_prod
 		&& !options.is_c_debug && !options.race && !options.c_compiler_explicit
+		&& !options.host_rejects_tcc
 		&& !(options.is_shared && !options.is_liveshared && options.target.os == 'linux')
 		&& (!options.parallel_cc || options.target.os == 'windows')
 		&& options.target.os == options.host_target.os
@@ -9222,6 +9231,7 @@ pub fn run(args []string) {
 	mut building_v := false
 	mut ownership_mode := false
 	mut verbose := false
+	mut show_timings := false
 	mut silent := false
 	mut deferred_implicit_tcc_warning := ''
 	mut skip_notices := false
@@ -9770,11 +9780,12 @@ pub fn run(args []string) {
 		} else if args[i] == '-raw-vsh-tmp-prefix' {
 			raw_vsh_tmp_prefix = args[i + 1]
 			i += 2
-		} else if args[i] in ['-show-timings', '-usecache', '-new-generic-solver', '-progress',
-			'-use-os-system-to-run'] {
-			// v3 already reports phase metrics, suppresses C warnings, leaves
-			// explicit-output tests unrun, caches modules by default, and uses
-			// its current generic solver without a legacy selection switch.
+		} else if args[i] == '-show-timings' {
+			show_timings = true
+			i++
+		} else if args[i] in ['-usecache', '-new-generic-solver', '-progress', '-use-os-system-to-run'] {
+			// v3 caches modules by default and uses its current generic solver
+			// without a legacy selection switch.
 			// `-progress` selects a reporter in the test runner, not in the compiler.
 			// Accept the corresponding V flags for compatibility.
 			i++
@@ -10281,22 +10292,20 @@ pub fn run(args []string) {
 	remove_binary_after_run := should_run && !is_crun && !is_direct_vsh && !explicit_output && !keep_c
 		&& !binary_existed_before
 
-	// Decide which backend modules to compile into the output. By default only the C
-	// backend is built; the fastc/arm64/wasm/eval backends (and the whole SSA pipeline that the
-	// arm64 backend pulls in: v.ssa + v.ssa.optimize) are skipped entirely. When compiling
-	// the V compiler itself this avoids parsing/checking/transforming/cgen-ing ~30k lines of
-	// unused backend code, which measurably speeds up the self-host build. The `skip_*`
+	// Decide which backend modules to compile into the output. Standalone compilers
+	// default to C; optional backends and their SSA dependencies can be skipped. This
+	// avoids parsing/checking/transforming/cgen-ing unused code when self-hosting. The `skip_*`
 	// defines drive two things in lock-step: `$if !skip_* ?` gates in main() make the parser
 	// drop the dispatch blocks (so the backend symbols are never referenced), and
 	// resolve_imports skips parsing the corresponding module directories.
 	// `-all-backends` keeps everything; `-compile-backend <name>` opts a specific backend back
 	// in; the active `-b` target backend is always force-included.
 	// The full `cmd/v` CLI (the executable that `make`, `makev.bat`, `v self`, and `v up`
-	// produce) always keeps FastC, so `-b fastc` works in default builds; `-d skip_fastc`
-	// still removes it. Standalone `vlib/v/v.v` builds and portable `-cross` C keep pruning it.
-	mut include_fastc := all_backends || v3_compiles_fastc_by_default(input_file, output_cross_c)
+	// produce) keeps WebAssembly and, through C, FastC. Direct ARM64 builds
+	// omit FastC's libtcc dependency. Explicit skip defines remove optional backends.
+	mut include_fastc := all_backends || v3_compiles_fastc_by_default(input_file, output_cross_c, backend)
 	mut include_arm64 := all_backends
-	mut include_wasm := all_backends
+	mut include_wasm := all_backends || (cmd_v_build && !output_cross_c)
 	mut include_eval := all_backends
 	for cb in compile_backends {
 		for name in cb.split(',') {
@@ -10344,6 +10353,9 @@ pub fn run(args []string) {
 	if !include_wasm {
 		user_defines << 'skip_wasm'
 	}
+	if !include_arm64 && !include_wasm {
+		user_defines << 'skip_ssa'
+	}
 	if !include_eval {
 		user_defines << 'skip_eval'
 	}
@@ -10364,7 +10376,7 @@ pub fn run(args []string) {
 	}
 	mut b := bench.new()
 	driver_sw := time.new_stopwatch()
-	if !verbose || silent || c_to_stdout {
+	if !(verbose || show_timings) || silent || c_to_stdout {
 		b.set_quiet()
 	}
 	if no_memory_limit {
@@ -10435,6 +10447,7 @@ pub fn run(args []string) {
 		host_target:         host_target
 		target:              target
 		bundled_tcc:         bundled_tcc
+		host_rejects_tcc:    pref.host_rejects_tcc_executables()
 	})
 	bundled_tcc_available := selection.bundled_tcc_available
 	implicit_tcc := selection.implicit_tcc
@@ -10448,7 +10461,7 @@ pub fn run(args []string) {
 			return
 		}
 	}
-	if verbose && !silent && !c_to_stdout && !use_implicit_tcc_semantics {
+	if (verbose || show_timings) && !silent && !c_to_stdout && !use_implicit_tcc_semantics {
 		println('=== V compiler benchmark ===')
 	}
 	if race {
@@ -11383,10 +11396,12 @@ pub fn run(args []string) {
 			return
 		}
 	}
-	if verbose && !silent && !c_to_stdout && use_implicit_tcc_semantics {
+	if (verbose || show_timings) && !silent && !c_to_stdout && use_implicit_tcc_semantics {
 		println('=== V compiler benchmark ===')
 	}
 	if only_check_syntax {
+		b.step('parse')
+		b.print_report()
 		clear_macos_v3_compiler_error_fallback(macos_v3_fallback_file)
 		return
 	}
@@ -11841,7 +11856,13 @@ pub fn run(args []string) {
 			&& scope_prealloc_markused && !incremental_cache_hit && !generic_cache_hit
 			&& !cache_state.manager.enabled && test_files.len == 0 && !is_checker_fixture
 			&& !trivial_literal_output && !is_vsh_input && !no_skip_unused
-		prepared_markused_thread := spawn markused.prepare_markused_declarations(a, &pre_tc, prepare_markused_overlap)
+		mut prepared_markused_threads := []thread &markused.PreparedMarkusedDecls{}
+		mut waited_markused := ?&markused.PreparedMarkusedDecls(none)
+		if prepare_markused_overlap {
+			prepared_markused_threads << spawn markused.prepare_markused_declarations(a, &pre_tc, true)
+		} else {
+			waited_markused = markused.prepare_markused_declarations(a, &pre_tc, false)
+		}
 		// A plain build of a program checks the bodies of the standard library that
 		// the program can reach, not the others (see types.skip_unreachable_library_bodies).
 		// What else needs every body checked keeps them all: a check without a build,
@@ -11920,11 +11941,10 @@ pub fn run(args []string) {
 		// the check, into the diagnostics, and the child prints what it printed.
 		// The rest of the check rewrites the tree the answers come from.
 		shares_checks := served.shares_checks()
-		mut waited_markused := ?&markused.PreparedMarkusedDecls(none)
-		if shares_checks {
+		if shares_checks && prepared_markused_threads.len > 0 {
 			// No thread of this process but the worker pools' goes into the
 			// grandchild.
-			waited_markused = prepared_markused_thread.wait()
+			waited_markused = prepared_markused_threads[0].wait()
 		}
 		if shares_checks {
 			// What the check found so far, for a client that shows it while the
@@ -11985,7 +12005,7 @@ pub fn run(args []string) {
 		mut prepared_markused := if waited := waited_markused {
 			waited
 		} else {
-			prepared_markused_thread.wait()
+			prepared_markused_threads[0].wait()
 		}
 		if verbose {
 			eprintln('  [ttime]   ck mkused wait   ${f64(ck_stage_sw.elapsed().microseconds()) / 1000.0:7.2f} ms')
@@ -12160,6 +12180,7 @@ pub fn run(args []string) {
 				print_type_diagnostics(a, pre_tc.notices, []types.TypeError{}, is_checker_fixture,
 					fatal_errors, check_only, message_limit, skip_notices)
 			}
+			b.print_report()
 			return
 		}
 		if cache_state.manager.enabled {
@@ -12217,7 +12238,10 @@ pub fn run(args []string) {
 		if prepare_transform_overlap {
 			transform.materialize_inferred_anonymous_structs_before_prepare(mut a, &pre_tc)
 		}
-		mut prepared_transform_thread := spawn transform.prepare_selfhost_transform(a, &pre_tc, prepare_transform_overlap)
+		mut prepared_transform_threads := []thread &transform.PreparedSelfhostTransform{}
+		if prepare_transform_overlap {
+			prepared_transform_threads << spawn transform.prepare_selfhost_transform(a, &pre_tc, true)
+		}
 		// Mark used functions (dead-code elimination). This is done before transform
 		// so the transformer can skip function bodies that the C backend will prune.
 		// Checking and inactive-comptime pruning can add or detach nodes. Rebuild the
@@ -12325,7 +12349,11 @@ pub fn run(args []string) {
 				eprintln('  [ttime] mu library bodies   ${pre_tc.skipped_library_bodies()} left unchecked, ${pre_tc.library_bodies_checked_late()} checked late (worker threads: ${a.worker_count()})')
 			}
 		}
-		mut prepared_transform := prepared_transform_thread.wait()
+		mut prepared_transform := if prepare_transform_overlap {
+			prepared_transform_threads[0].wait()
+		} else {
+			transform.prepare_selfhost_transform(a, &pre_tc, false)
+		}
 		b.step('markused')
 		b.metric('reachable symbols', used_fns.len, 'symbols')
 		mut tfpre_sw := time.new_stopwatch()
@@ -13068,18 +13096,53 @@ pub fn run(args []string) {
 			// Generate only after monomorphization has pruned deferred generic comptime
 			// branches. output_file is the exact path requested via -o (or the
 			// <name>.wasm default).
-			mut g := wasmgen.Gen.new(a, pre_tc, used_fns)
-			g.gen()
+			mut metadata := wasmgen.Gen.new(a, pre_tc, used_fns)
+			config := metadata.ssa_configuration()
+			mut m := ssa.build_with_options(a, config.used_fns, pre_tc, ssa.BuildOptions{
+				target:         ssa.TargetData{ ptr_size: 4 }
+				track_uses:     is_prod
+				exact_used_fns: true
+				source_modules: config.source_modules
+				source_imports: config.source_imports
+			})
+			b.step('ssa build')
+			if is_prod {
+				optimize.optimize(mut m)
+				b.step('optimize')
+			}
+			m.release_codegen_analysis_metadata()
+			mut g := wasmgen.SSAGen.new(m)
+			mut main_fn := config.main_fn
+			mut exports := config.exports.clone()
+			if main_fn.len == 0 {
+				// SSA synthesizes main for scripts with top-level statements.
+				for f in m.funcs {
+					if f.name == 'main' && f.blocks.len > 0 && !f.is_c_extern {
+						main_fn = f.name
+						exports[main_fn] = 'main'
+						break
+					}
+				}
+			}
+			g.configure(exports, config.init_fns, main_fn)
+			g.gen() or {
+				eprintln(err.msg())
+				exit(1)
+			}
 			g.write(output_file) or {
 				eprintln('error writing ${output_file}')
 				exit(1)
 			}
-			for w in g.warnings_list() {
-				eprintln('wasm: ${w}')
+			for warning in g.warnings_list() {
+				eprintln('wasm: ${warning}')
 			}
 			b.step('wasm gen')
 			b.print_report()
 			return
+		} $else {
+			eprintln('WebAssembly support is not compiled into this executable')
+			eprintln('Rebuild with `v -compile-backend wasm self` or `-all-backends`.')
+			exit(1)
 		}
 	}
 	mut newly_cached_module_count := 0
@@ -13091,7 +13154,10 @@ pub fn run(args []string) {
 		$if !skip_arm64 ? {
 			// SSA + ARM64 native backend
 			mut m := ssa.build_with_options(a, used_fns, pre_tc, ssa.BuildOptions{
-				track_uses: is_prod
+				track_uses:        is_prod
+				thread_stack_size: prefs.thread_stack_size
+				test_files:        test_files
+				test_run_only:     run_only
 			})
 			b.step('ssa build')
 			b.metric('SSA values before optimize', m.values.len, 'values')
@@ -13113,6 +13179,30 @@ pub fn run(args []string) {
 
 			g.write_and_link(bin_file)
 			b.step('link')
+			clear_macos_v3_compiler_error_fallback(macos_v3_fallback_file)
+			if should_run {
+				run_result := run_binary(bin_file, run_args)
+				if remove_binary_after_run {
+					os.rm(bin_file) or {}
+					if (is_debug || race) && target.os == 'macos' {
+						v3_remove_macos_debug_symbols(bin_file)
+					}
+				}
+				if run_result != 0 {
+					exit(run_result)
+				}
+				b.step('run')
+			} else if test_files.len > 0 && (!explicit_output || is_checker_fixture || show_test_stats) {
+				test_result := run_test_binary(bin_file)
+				if test_result != 0 {
+					exit(test_result)
+				}
+				b.step('test')
+			}
+		} $else {
+			eprintln('ARM64 support is not compiled into this executable')
+			eprintln('Rebuild with `v -compile-backend arm64 self` or `-all-backends`.')
+			exit(1)
 		}
 	} else {
 		// C backend (default)
@@ -18206,18 +18296,20 @@ fn real_path_is_in_dir(real_path string, real_dir string) bool {
 
 // skipped_backend_module_groups lists the importable backend module groups that the current
 // configuration excludes (driven by the same `skip_*` defines that gate the dispatch in
-// main()). The arm64 backend is the only consumer of the SSA pipeline, so it shares a group
-// with v.ssa and v.ssa.optimize.
+// main()). SSA is shared by ARM64 and WebAssembly and is excluded only when both are disabled.
 fn skipped_backend_module_groups(prefs &pref.Preferences) [][]string {
 	mut skipped := [][]string{}
 	if 'skip_fastc' in prefs.user_defines {
 		skipped << ['v.gen.fastc', 'v.fastcdriver']
 	}
 	if 'skip_arm64' in prefs.user_defines {
-		skipped << ['v.gen.arm64', 'v.ssa', 'v.ssa.optimize']
+		skipped << ['v.gen.arm64']
 	}
 	if 'skip_wasm' in prefs.user_defines {
 		skipped << ['v.gen.wasm']
+	}
+	if 'skip_arm64' in prefs.user_defines && 'skip_wasm' in prefs.user_defines {
+		skipped << ['v.ssa', 'v.ssa.optimize']
 	}
 	if 'skip_eval' in prefs.user_defines {
 		skipped << ['v.eval']
@@ -20708,10 +20800,14 @@ fn resolve_imports(mut a flat.FlatAst, mut p parser.Parser, prefs &pref.Preferen
 	// dispatch in main() is gated out by the matching `$if !skip_* ?`, so nothing
 	// references their symbols. Pre-seeding parsed_modules makes the loop below treat
 	// them as already handled, so neither v.v's top-level imports nor any transitive
-	// import pulls them in. Skipping the arm64 group (v.gen.arm64 + the v.ssa SSA
-	// pipeline) and the wasm/eval backends avoids ~30k lines of work when self-hosting.
+	// import pulls them in. The shared SSA pipeline is retained when either consumer is
+	// explicitly imported, even if neither backend is enabled in the compiler being built.
 	for skipped_group in skipped_backend_module_groups(prefs) {
 		mut group_requested := false
+		if 'v.ssa' in skipped_group
+			&& ('v.gen.arm64' in explicit_initial_imports || 'v.gen.wasm' in explicit_initial_imports) {
+			group_requested = true
+		}
 		for skipped in skipped_group {
 			if skipped in explicit_initial_imports {
 				group_requested = true

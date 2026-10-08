@@ -187,6 +187,8 @@ mut:
 	// defer_pre_scan_indexes routes the AST/tc-only index builders in prepare()
 	// to the overlapped pre-scan helper thread (see prepare_with_pre_scans).
 	defer_pre_scan_indexes bool
+	// Fixed-array summaries can reuse the completed parameter pre-scan cache.
+	defer_fixed_array_borrow_prep bool
 	// merge_regions_relocated marks worker regions as already id-relocated in
 	// place (parallel pass), so merge_worker compacts with plain memmoves.
 	merge_regions_relocated bool
@@ -221,6 +223,7 @@ mut:
 	building_v                          bool
 	var_types                           []VarTypeBinding
 	comptime_scalar_locals              map[string]ComptimeStringScalar
+	cur_stmt_list                       []flat.NodeId // the statement list being transformed
 	var_type_indices                    map[string]int
 	var_type_cache                      &VarTypeIndexCache = unsafe { nil }
 	refined_node_types                  map[int]string
@@ -249,6 +252,7 @@ mut:
 	in_call_callee                      bool
 	in_monomorphize_scan                bool
 	validating_generic_spec             bool
+	fn_body_locals_in_scope             bool
 	allow_comptime_enum_int_assign      bool
 	monomorph_errors                    []string
 	monomorph_error_seen                map[string]bool
@@ -2086,7 +2090,9 @@ fn (mut t Transformer) prepare() {
 	t.raw_return_alias_cache = &ContextBoolLookupCache{}
 	t.prepare_interface_impl_indexes()
 	t.ierror_none_type_id = t.interface_impl_type_id('IError', 'None__') or { 0 }
-	t.prepare_fixed_array_borrow_params()
+	if !t.defer_fixed_array_borrow_prep {
+		t.prepare_fixed_array_borrow_params()
+	}
 }
 
 fn (mut t Transformer) rebuild_embedded_fields_index() {
@@ -6566,7 +6572,10 @@ fn (mut t Transformer) transform_string_interp_part(child_id flat.NodeId) flat.N
 		&& t.string_interp_needs_value_read(expr_node.value, typ) {
 		// Reading a local moved to the heap already dereferences its storage, while
 		// `typ` can still be the `&Alias` of that storage: read the value only once.
-		if !t.is_value_read_of(transformed, expr_node.value) {
+		// A `mut n &T` parameter is a slot for the pointer, so its `*n` is still `&T`.
+		is_mut_pointer_param := t.mut_param_values[expr_node.value]
+			&& t.var_type(expr_node.value).starts_with('&')
+		if is_mut_pointer_param || !t.is_value_read_of(transformed, expr_node.value) {
 			transformed = t.make_prefix(.mul, transformed)
 		}
 		typ = typ[1..]
@@ -10736,6 +10745,9 @@ fn (mut t Transformer) heap_fixed_array_view_params(fn_node flat.Node, param_typ
 }
 
 fn (mut t Transformer) transform_fn_body(fn_idx int) {
+	outer_locals_in_scope := t.fn_body_locals_in_scope
+	t.fn_body_locals_in_scope = false
+	defer { t.fn_body_locals_in_scope = outer_locals_in_scope }
 	outer_comptime_locals := t.comptime_scalar_locals
 	t.comptime_scalar_locals = map[string]ComptimeStringScalar{}
 	defer { t.comptime_scalar_locals = outer_comptime_locals }
@@ -10936,6 +10948,9 @@ fn (mut t Transformer) transform_fn_body(fn_idx int) {
 	}
 	param_replacements, entry_stmts := t.heap_fixed_array_view_params(fn_node, param_types)
 	mut new_body := entry_stmts.clone()
+	// Structural pre-passes need lexical lookups; statement lowering records locals
+	// in declaration order, so its live scope can resolve callable shadows directly.
+	t.fn_body_locals_in_scope = true
 	new_body << t.transform_stmts(body_ids)
 	// Rebuild function children: params then new body
 	mut new_children := []flat.NodeId{cap: int(fn_node.children_count)}
@@ -11120,7 +11135,12 @@ fn (t &Transformer) fn_return_type_for_name(name string) ?string {
 pub fn (mut t Transformer) transform_stmts(ids []flat.NodeId) []flat.NodeId {
 	mut result := []flat.NodeId{cap: ids.len}
 	saved_comptime_locals := t.comptime_scalar_locals.clone()
-	defer { t.comptime_scalar_locals = saved_comptime_locals }
+	outer_stmt_list := t.cur_stmt_list
+	t.cur_stmt_list = ids
+	defer {
+		t.comptime_scalar_locals = saved_comptime_locals
+		t.cur_stmt_list = outer_stmt_list
+	}
 	had_base_smartcasts := t.smartcast_stack.len > 0
 	base_smartcasts := if had_base_smartcasts {
 		t.smartcast_stack.clone()
@@ -16819,7 +16839,7 @@ fn (mut t Transformer) try_lower_string_compound_assign(_id flat.NodeId, node fl
 		return none
 	}
 	new_rhs := if t.normalize_type_alias(t.node_type(rhs_id)) in ['char', 'rune'] {
-		t.stringify_expr(rhs_id)
+		t.stringify_expr(rhs_id, false)
 	} else {
 		t.transform_expr(rhs_id)
 	}

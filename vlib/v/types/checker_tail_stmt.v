@@ -30,7 +30,9 @@ fn (mut tc TypeChecker) mark_statement_context(id flat.NodeId) {
 	mut current := id
 	for tc.valid_node_id(current) {
 		idx := int(current)
-		if tc.parallel_check_sparse {
+		if !isnil(tc.storage_query_probe) {
+			tc.sparse_statement_nodes[idx] = true
+		} else if tc.parallel_check_sparse {
 			if tc.in_check_range(idx) && idx < tc.statement_nodes.len {
 				tc.statement_nodes[idx] = true
 			} else {
@@ -54,11 +56,19 @@ fn (mut tc TypeChecker) mark_statement_context(id flat.NodeId) {
 
 fn (tc &TypeChecker) is_statement_node(id flat.NodeId) bool {
 	idx := int(id)
+	if !isnil(tc.storage_query_probe) {
+		if recorded := tc.sparse_statement_nodes[idx] { return recorded }
+		if !isnil(tc.storage_query_probe.read_base) {
+			return tc.storage_query_probe.read_base.is_statement_node(id)
+		}
+		return false
+	}
 	if tc.parallel_check_sparse {
 		if tc.in_check_range(idx) {
 			return idx < tc.statement_nodes.len && tc.statement_nodes[idx]
 		}
-		return tc.sparse_statement_nodes[idx]
+		if recorded := tc.sparse_statement_nodes[idx] { return recorded }
+		return false
 	}
 	return idx >= 0 && idx < tc.statement_nodes.len && tc.statement_nodes[idx]
 }
@@ -9384,14 +9394,14 @@ fn (tc &TypeChecker) selector_fn_value_key(node flat.Node) ?string {
 			}
 			return none
 		}
+		if key := tc.static_assoc_fn_key_for_base(base.value, node.value) {
+			return key
+		}
 		for type_name in tc.static_assoc_type_candidates(base.value) {
 			key := '${type_name}.${node.value}'
 			if tc.fn_signature_known(key) {
 				return key
 			}
-		}
-		if key := tc.static_assoc_fn_key_for_base(base.value, node.value) {
-			return key
 		}
 		if key := tc.unbound_instance_method_key(base.value, node.value) {
 			return key
@@ -9406,12 +9416,12 @@ fn (tc &TypeChecker) selector_fn_value_key(node flat.Node) ?string {
 				return none
 			}
 			mod_name := tc.resolve_import_alias(inner.value) or { inner.value }
+			if static_key := tc.static_assoc_fn_key_for_base('${mod_name}.${base.value}', node.value) {
+				return static_key
+			}
 			key := '${mod_name}.${base.value}.${node.value}'
 			if tc.fn_signature_known(key) {
 				return key
-			}
-			if static_key := tc.static_assoc_fn_key_for_base('${mod_name}.${base.value}', node.value) {
-				return static_key
 			}
 			if instance_key := tc.unbound_instance_method_key('${mod_name}.${base.value}', node.value) {
 				return instance_key
@@ -14911,7 +14921,7 @@ fn (tc &TypeChecker) smartcast_type(id flat.NodeId) ?Type {
 		}
 	}
 	result := tc.lexical_smartcast_type(id, key) or {
-		if !tc.resolution_type_mode && idx < tc.lexical_smartcast_misses.len
+		if isnil(tc.storage_query_probe) && !tc.resolution_type_mode && idx < tc.lexical_smartcast_misses.len
 			&& (!tc.parallel_check_sparse || (idx >= tc.check_range_lo && idx <= tc.check_range_hi)) {
 			mut writable := unsafe { tc }
 			writable.lexical_smartcast_misses[idx] = true
@@ -15801,7 +15811,11 @@ fn type_recent_hash_slot(typ Type) (u64, int) {
 fn type_value_words(typ &Type) (u64, u64, int) {
 	words := unsafe { &u64(voidptr(typ)) }
 	w0 := unsafe { words[0] }
-	w1 := unsafe { words[1] }
+	mut w1 := unsafe { words[1] }
+	$if native ? {
+		// Native sums store each variant in its own pointer slot after the tag.
+		w1 = if w0 == 0 { u64(0) } else { unsafe { words[int(w0)] } }
+	}
 	return w0, w1, int(((w0 >> 4) ^ w1) & 2047)
 }
 
@@ -17507,9 +17521,15 @@ fn (mut memo BodyResolveMemo) begin(lo int, hi int) {
 	memo.active = true
 }
 
+// resolve_type returns the type of an expression in the current checker context.
 @[direct_array_access]
 pub fn (tc &TypeChecker) resolve_type(id flat.NodeId) Type {
 	if tc.trust_checked_expr_types {
+		if !isnil(tc.storage_query_probe) {
+			if typ := tc.cached_expr_type(id) {
+				if !type_contains_unknown(typ) { return tc.widen_mixed_integer_expr_type(id, typ) }
+			}
+		}
 		// Post-check phases re-resolve mostly unchanged subtrees the checker
 		// already typed. Serve those straight from the dense per-node cache:
 		// dense in-range entries are checker-authored, transform's node-write
@@ -17517,12 +17537,17 @@ pub fn (tc &TypeChecker) resolve_type(id flat.NodeId) Type {
 		// beyond the dense range so they resolve normally below. Cached
 		// unknowns stay excluded — a later registration may resolve them.
 		tidx := int(id)
-		if tidx >= 0 && tidx < tc.expr_type_set.len && tc.expr_type_set[tidx]
+		if isnil(tc.storage_query_probe) && tidx >= 0 && tidx < tc.expr_type_set.len && tc.expr_type_set[tidx]
 			&& (!tc.parallel_check_sparse || tc.in_check_range(tidx)) {
 			typ := tc.expr_type_values[tidx]
 			if !type_contains_unknown(typ) {
 				return tc.widen_mixed_integer_expr_type(id, typ)
 			}
+		}
+	}
+	if !isnil(tc.storage_query_probe) {
+		if typ := tc.storage_query_probe_checked_type(id) {
+			return tc.widen_mixed_integer_expr_type(id, typ)
 		}
 	}
 	memo := tc.body_resolve_memo
